@@ -1,11 +1,41 @@
 const puppeteer = require('puppeteer');
-const axios = require('axios');
+const { Anthropic } = require('@anthropic-ai/sdk');
+
+// Haiku : latence minimale, le score Kahoot dépend de la vitesse de réponse.
+const MODEL = 'claude-haiku-5-5';
+const SYSTEM_PROMPT = 'Tu réponds à des questions de quiz. Donne le numéro du choix correct dans le champ "choice".';
+
+// Schéma de sortie structurée : {"choice": <index valide>}, rien d'autre.
+function choiceSchema(choiceCount) {
+    return {
+        type: 'object',
+        properties: {
+            choice: { type: 'integer', enum: Array.from({ length: choiceCount }, (_, i) => i) },
+        },
+        required: ['choice'],
+        additionalProperties: false,
+    };
+}
+
+// Parse la sortie JSON du modèle ; null si invalide ou hors bornes (défense en profondeur).
+function parseChoice(output, choiceCount) {
+    let data;
+    try {
+        data = JSON.parse(output);
+    } catch {
+        return null;
+    }
+    const idx = data?.choice;
+    return Number.isInteger(idx) && idx >= 0 && idx < choiceCount ? idx : null;
+}
 
 class KahootHandler {
     constructor() {
         this.browser = null;
         this.page = null;
         this.lastQuestion = '';
+        this.aiPending = false;
+        this.monitorTimer = null;
     }
 
     getGamePhase() {
@@ -135,7 +165,7 @@ class KahootHandler {
     async getCurrentScore() {
         if (!this.page) return '';
         return await this.page.evaluate(() => {
-            const el = document.querySelector('div[data-functional-selector="bottom-bar-score"]');
+            const el = document.querySelector('[data-functional-selector="bottom-bar-score"]');
             return el ? el.innerText.trim() : '';
         });
     }
@@ -168,36 +198,62 @@ class KahootHandler {
         });
     }
 
-    async answerWithOpenAI(apiKey) {
+    async answerWithAI() {
+        if (this.aiPending || this.getGamePhase() !== 'question') return;
         const { question, answers } = await this.getCurrentQuestionAndAnswers();
         if (!question || !answers.length) return;
-        if (this.lastQuestion === question) return; // Ne pas traiter deux fois la même question
-        this.lastQuestion = question;
-        // Prompt court et direct
-        const prompt = `Voici une question de quiz et ses choix. Réponds uniquement par le numéro du choix correct (0, 1, 2 ou 3).\nQuestion : ${question}\nChoix :\n${answers.map((a, i) => i + '. ' + a).join('\n')}\nRéponds uniquement par le numéro.`;
+        if (this.lastQuestion === question) return; // Question déjà traitée avec succès
+
+        this.aiPending = true;
+        const last = answers.length - 1;
+        const prompt = `Question : ${question}\nChoix :\n${answers.map((a, i) => `${i}. ${a}`).join('\n')}\nNuméro du choix correct (0 à ${last}) ?`;
         try {
-            const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-                model: 'gpt-3.5-turbo',
+            const response = await this.client.messages.create({
+                model: MODEL,
+                max_tokens: 32,
+                // Réflexion désactivée : sinon elle consomme max_tokens et la sortie texte est vide.
+                thinking: { type: 'disabled' },
+                output_config: {
+                    effort: 'low',
+                    format: { type: 'json_schema', schema: choiceSchema(answers.length) },
+                },
+                system: SYSTEM_PROMPT,
                 messages: [{ role: 'user', content: prompt }],
-                max_tokens: 5,
-                temperature: 0
-            }, {
-                headers: {
-                    'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
-                }
             });
-            const output = response.data.choices[0].message.content.trim();
-            // Trouver l'index de la réponse
-            const match = output.match(/\d/);
-            if (match) {
-                const idx = parseInt(match[0], 10);
-                await this.clickAnswer(idx);
+            const output = response.content
+                .filter(b => b.type === 'text')
+                .map(b => b.text)
+                .join('')
+                .trim();
+            console.log(`IA : "${question}" -> ${JSON.stringify(output)} (stop_reason=${response.stop_reason})`);
+
+            if (response.stop_reason === 'refusal') {
+                this.lastAIResponse = 'Refus du modèle';
+                this.lastQuestion = question; // inutile de réessayer
+                return;
             }
-            // Stocker la réponse IA pour affichage
-            this.lastAIResponse = output;
+            const idx = parseChoice(output, answers.length);
+            if (idx === null) {
+                this.lastAIResponse = `Réponse inexploitable : ${JSON.stringify(output)}`;
+                console.error(this.lastAIResponse);
+                return; // lastQuestion non mis à jour -> nouvel essai au prochain tick
+            }
+            this.lastQuestion = question;
+            this.lastAIResponse = `${idx} (${answers[idx]})`;
+            await this.clickAnswer(idx);
         } catch (e) {
-            this.lastAIResponse = 'Erreur IA: ' + (e.response?.data?.error?.message || e.message);
+            if (e instanceof Anthropic.AuthenticationError) {
+                this.lastAIResponse = 'Erreur IA : clé API invalide';
+            } else if (e instanceof Anthropic.RateLimitError) {
+                this.lastAIResponse = 'Erreur IA : limite de débit atteinte';
+            } else if (e instanceof Anthropic.APIError) {
+                this.lastAIResponse = `Erreur IA ${e.status} : ${e.message}`;
+            } else {
+                this.lastAIResponse = `Erreur IA : ${e.message}`;
+            }
+            console.error(this.lastAIResponse);
+        } finally {
+            this.aiPending = false;
         }
     }
 
@@ -255,11 +311,16 @@ class KahootHandler {
     }
 
     // Surveiller les questions et répondre automatiquement
-    async monitorQuestions(apiKey) {
-        setInterval(() => {
-            this.answerWithOpenAI(apiKey);
+    monitorQuestions(apiKey) {
+        // Délai court et un seul nouvel essai : une réponse tardive ne rapporte rien.
+        this.client = new Anthropic({ apiKey, timeout: 10_000, maxRetries: 1 });
+        if (this.monitorTimer) clearInterval(this.monitorTimer);
+        this.monitorTimer = setInterval(() => {
+            this.answerWithAI().catch(e => console.error('Boucle IA :', e.message));
         }, 1000);
     }
 }
 
-module.exports = KahootHandler; 
+module.exports = KahootHandler;
+module.exports.parseChoice = parseChoice;
+module.exports.choiceSchema = choiceSchema;
